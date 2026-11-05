@@ -17,7 +17,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: uv pip install --system -e ".[dev]"
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python -e ".[dev]"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Lint
         run: ruff check src tests && ruff format --check src tests
       - name: Types
@@ -25,4 +28,4 @@ jobs:
       - name: Tests (including signing vectors)
         run: pytest -q -rs
       - name: Signing vectors must not be skipped in CI
-        run: pytest -q -m signing --co -q | grep -q "test_signing_vectors"
+        run: pytest -q -m signing -rs | tee signing.log && ! grep -q "SKIPPED" signing.log
