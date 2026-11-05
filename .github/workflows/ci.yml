@@ -18,7 +18,7 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: |
-          uv venv .venv
+          uv venv --clear .venv
           uv pip install --python .venv/bin/python -e ".[dev]"
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Lint
