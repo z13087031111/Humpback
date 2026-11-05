@@ -1,0 +1,23 @@
+# Humpback risk limits. Copy to var/risk.toml and adjust.
+# Numbers are written as strings on purpose: TOML floats are binary and are rejected.
+
+[risk]
+max_order_notional = "500"       # USD per order
+max_symbol_notional = "1500"     # worst-case USD exposure per symbol, live orders included
+max_gross_notional = "3000"      # worst-case USD exposure across everything
+max_daily_loss = "150"           # realized loss per UTC day before switching to reduce-only
+max_orders_per_minute = 20
+max_price_deviation_bps = "150"  # limit price vs reference price
+approval_ttl_ms = 5000
+
+# venue:symbol pairs that may be traded at all
+allowed = [
+  "hyperliquid:BTC",
+  "hyperliquid:ETH",
+]
+
+# Notional limits are multiplied by these when an equity perp is not normally priced.
+[risk.pricing_mode_scale]
+normal = "1"
+off_hours_smoothed = "0.5"
+internal_fallback = "0.25"

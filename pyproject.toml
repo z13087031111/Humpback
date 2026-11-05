@@ -1,0 +1,63 @@
+[project]
+name = "humpback"
+version = "0.1.0"
+description = "Humpback: a personal, medium-frequency on-chain trading system for Hyperliquid, Lighter and Aster"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = []
+
+[project.optional-dependencies]
+# Real signing backends. Kept optional so the core ledger and risk code has no third-party deps.
+signing = [
+  "eth-account>=0.13",
+  "msgpack>=1.0",
+]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "eth-account>=0.13",
+  "msgpack>=1.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/humpback"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+  "signing: needs eth-account and msgpack (real cryptographic vectors)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "S", "DTZ", "T20"]
+ignore = [
+  "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004",
+  "S101",     # asserts are fine in tests
+  "RUF001", "RUF002", "RUF003",  # Chinese punctuation in docstrings is intended
+  "PLC0415",  # optional signing deps are imported lazily on purpose
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "PLR", "T20"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["humpback"]
+
+[[tool.mypy.overrides]]
+module = ["eth_account.*", "msgpack.*", "eth_utils.*"]
+ignore_missing_imports = true
