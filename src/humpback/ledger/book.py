@@ -109,7 +109,16 @@ class Ledger:
         ]
 
     def unresolved_orders(self) -> list[OrderView]:
-        return [o for o in self._orders.values() if o.status in om.NEEDS_RESOLUTION]
+        return [o for o in self._orders.values() if o.needs_resolution]
+
+    def exposure_orders(self, venue: Venue | None = None) -> list[OrderView]:
+        """Orders that can still change a position: live ones, plus finished ones whose
+        venue-reported fills have not all been booked yet."""
+        return [
+            o
+            for o in self._orders.values()
+            if (o.is_live or o.unbooked_qty > ZERO) and (venue is None or o.intent.venue is venue)
+        ]
 
     def position(self, venue: Venue, account: str, symbol: str) -> Position:
         return self._positions.get((venue, account, symbol), Position())
@@ -139,6 +148,8 @@ class Ledger:
         the same key with different content raises.
         """
         existing_id = self._by_business_key.get(intent.business_key)
+        if existing_id is None and intent.intent_id in self._orders:
+            raise LedgerError(f"intent id {intent.intent_id} already used by another decision")
         if existing_id is not None:
             existing = self._orders[existing_id]
             if existing.intent.content_hash() != intent.content_hash():

@@ -15,41 +15,56 @@ from typing import Literal
 from humpback.core.clock import Clock
 from humpback.core.errors import SignerRefused
 
-_SCHEMA = "CREATE TABLE IF NOT EXISTS nonces (signer TEXT PRIMARY KEY, last INTEGER NOT NULL)"
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS nonces (signer TEXT PRIMARY KEY, last INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS used_approvals (mac TEXT PRIMARY KEY, expires_at_ms INTEGER NOT NULL);
+"""
 
 
 class NonceAllocator:
     def __init__(self, path: str | Path, clock: Clock, *, max_lead_ms: int = 30_000) -> None:
         self._db = sqlite3.connect(str(path), isolation_level=None)
         self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute(_SCHEMA)
+        self._db.executescript(_SCHEMA)
         self._clock = clock
         self._max_lead_ms = max_lead_ms
 
     def next(self, signer: str, unit: Literal["ms", "us"]) -> int:
-        signer = signer.lower()
+        # Milliseconds and microseconds live on different scales; never share a counter.
+        key = f"{signer.lower()}:{unit}"
         now = self._clock.now_ms() * (1000 if unit == "us" else 1)
         self._db.execute("BEGIN IMMEDIATE")
         try:
-            row = self._db.execute("SELECT last FROM nonces WHERE signer = ?", (signer,)).fetchone()
+            row = self._db.execute("SELECT last FROM nonces WHERE signer = ?", (key,)).fetchone()
             last = -1 if row is None else int(row[0])
             nonce = max(now, last + 1)
             lead = nonce - now
             if lead > self._max_lead_ms * (1000 if unit == "us" else 1):
                 raise SignerRefused(
-                    f"nonce for {signer} would run {lead}{unit} ahead of time",
+                    f"nonce for {key} would run {lead}{unit} ahead of time",
                     code="NONCE_AHEAD_OF_CLOCK",
                 )
             self._db.execute(
                 "INSERT INTO nonces(signer, last) VALUES (?, ?) "
                 "ON CONFLICT(signer) DO UPDATE SET last = excluded.last",
-                (signer, nonce),
+                (key, nonce),
             )
         except BaseException:
             self._db.execute("ROLLBACK")
             raise
         self._db.execute("COMMIT")
         return nonce
+
+    def consume_approval(self, mac: str, expires_at_ms: int) -> bool:
+        """Mark an approval as used. False if it was used before."""
+        try:
+            self._db.execute(
+                "INSERT INTO used_approvals(mac, expires_at_ms) VALUES (?, ?)",
+                (mac, expires_at_ms),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        return True
 
     def close(self) -> None:
         self._db.close()

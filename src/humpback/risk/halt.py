@@ -1,13 +1,19 @@
 """Emergency stop with three separately recorded stages.
 
     HALT_DECIDED               the decision to stop (who, why, scope)
-    CANCEL_OR_CLOSE_REQUESTED  every cancel / reduce-only close actually sent
+    CANCEL_OR_CLOSE_REQUESTED  every cancel / reduce-only close attempted, and any failures
     VENUE_EXECUTION_CONFIRMED  the venues confirm it: no live orders, positions flat if a
                                close was requested, and reconciliation clean
 
 Sending a close is not closing a position. ``confirm`` refuses to record the last stage until
-the ledger *and* the venue agree. The supervisor stays in ``HALT_NEW_ORDERS`` until an
-operator resumes after confirmation.
+the ledger *and* the venue agree.
+
+Each halt raises its own supervisor reason (``emergency_stop:<halt_id>``), so resuming one
+halt never lifts another. Halts are persisted in the ledger; on restart every halt that was
+not resumed is raised again before anything can trade.
+
+One failing cancel or close never stops the rest: each is attempted independently and its
+failure is recorded in stage 2.
 """
 
 from __future__ import annotations
@@ -17,12 +23,13 @@ from decimal import Decimal
 from enum import StrEnum
 
 from humpback.core.ids import new_id, new_trace_id
-from humpback.core.money import BPS, ZERO, quantize_down, quantize_up
+from humpback.core.money import BPS, ZERO
 from humpback.domain.models import OrderIntent, OrderType, Side, TimeInForce, Venue
 from humpback.engine import OrderManager
 from humpback.ledger.events import EventKind
 from humpback.recon.reconciler import Reconciler
-from humpback.risk.supervisor import EMERGENCY_STOP, TradingMode
+from humpback.risk.supervisor import TradingMode, emergency_stop
+from humpback.venues.base import InstrumentRules
 
 
 class HaltStage(StrEnum):
@@ -36,6 +43,9 @@ class HaltStatus:
     halt_id: str
     stage: HaltStage
     pending: tuple[str, ...]
+
+
+Scope = tuple[list[tuple[Venue, str]], bool]
 
 
 class EmergencyStop:
@@ -52,7 +62,10 @@ class EmergencyStop:
         self.clock = manager.clock
         self.reconciler = reconciler
         self.close_slippage_bps = close_slippage_bps
-        self._scope: dict[str, tuple[list[tuple[Venue, str]], bool]] = {}
+        self._scope: dict[str, Scope] = {}
+        self._restore()
+
+    # ------------------------------------------------------------------ public
 
     def trigger(
         self,
@@ -64,8 +77,9 @@ class EmergencyStop:
     ) -> str:
         halt_id = new_id()
         trace_id = new_trace_id()
-        now = self.clock.now_ms()
-        self.supervisor.raise_reason(EMERGENCY_STOP, TradingMode.HALT_NEW_ORDERS, reason, now)
+        self.supervisor.raise_reason(
+            emergency_stop(halt_id), TradingMode.HALT_NEW_ORDERS, reason, self.clock.now_ms()
+        )
         self._stage(
             halt_id,
             HaltStage.HALT_DECIDED,
@@ -80,9 +94,14 @@ class EmergencyStop:
         requested: list[str] = []
         for venue, account in accounts:
             for view in self.ledger.live_orders(venue):
-                if view.intent.account == account:
-                    self.manager.cancel(view.intent.intent_id)
-                    requested.append(f"cancel:{view.intent.intent_id}")
+                if view.intent.account != account:
+                    continue
+                order_id = view.intent.intent_id
+                try:
+                    after = self.manager.cancel(order_id)
+                    requested.append(f"cancel:{order_id}:{after.status.value}")
+                except Exception as exc:
+                    requested.append(f"cancel_failed:{order_id}:{type(exc).__name__}")
             if close_positions:
                 requested.extend(self._close_all(halt_id, venue, account, trace_id))
         self._stage(halt_id, HaltStage.CANCEL_OR_CLOSE_REQUESTED, trace_id, requests=requested)
@@ -107,7 +126,8 @@ class EmergencyStop:
                 )
         if pending:
             return HaltStatus(halt_id, self.stage(halt_id), tuple(pending))
-        self._stage(halt_id, HaltStage.VENUE_EXECUTION_CONFIRMED, new_trace_id())
+        if self.stage(halt_id) is not HaltStage.VENUE_EXECUTION_CONFIRMED:
+            self._stage(halt_id, HaltStage.VENUE_EXECUTION_CONFIRMED, new_trace_id())
         return HaltStatus(halt_id, HaltStage.VENUE_EXECUTION_CONFIRMED, ())
 
     def resume(self, halt_id: str, operator: str) -> None:
@@ -116,13 +136,46 @@ class EmergencyStop:
         self._stage(
             halt_id, HaltStage.VENUE_EXECUTION_CONFIRMED, new_trace_id(), resumed_by=operator
         )
-        self.supervisor.clear_reason(EMERGENCY_STOP)
+        self.supervisor.clear_reason(emergency_stop(halt_id))
 
     def stage(self, halt_id: str) -> HaltStage:
         stages = [HaltStage(e.payload["stage"]) for e in self.ledger.events_for(f"halt:{halt_id}")]
         if not stages:
             raise KeyError(halt_id)
         return stages[-1]
+
+    def open_halts(self) -> list[str]:
+        return list(self._scope)
+
+    # ------------------------------------------------------------------ internals
+
+    def _restore(self) -> None:
+        """Re-raise every halt that was never resumed (survives a restart)."""
+        decided: dict[str, Scope] = {}
+        resumed: set[str] = set()
+        for event in self.ledger.store.events():
+            if event.kind != EventKind.HALT_STAGE:
+                continue
+            halt_id = event.stream.removeprefix("halt:")
+            payload = event.payload
+            if payload["stage"] == HaltStage.HALT_DECIDED:
+                accounts = []
+                for item in payload["accounts"]:
+                    venue, _, account = item.partition(":")
+                    accounts.append((Venue(venue), account))
+                decided[halt_id] = (accounts, bool(payload["close_positions"]))
+            if payload.get("resumed_by"):
+                resumed.add(halt_id)
+        for halt_id, scope in decided.items():
+            if halt_id in resumed:
+                continue
+            self._scope[halt_id] = scope
+            self.supervisor.raise_reason(
+                emergency_stop(halt_id),
+                TradingMode.HALT_NEW_ORDERS,
+                "restored after restart",
+                self.clock.now_ms(),
+            )
 
     def _stage(self, halt_id: str, stage: HaltStage, trace_id: str, **detail: object) -> None:
         self.ledger.append_raw(
@@ -138,42 +191,58 @@ class EmergencyStop:
         for (v, a, symbol), position in self.ledger.positions().items():
             if v is not venue or a != account or position.quantity == ZERO:
                 continue
-            ref = self.manager.market.context(venue, symbol).reference_price
-            if ref is None:
-                out.append(f"close_skipped_no_price:{symbol}")
-                continue
-            side = Side.SELL if position.quantity > ZERO else Side.BUY
-            factor = (
-                BPS - self.close_slippage_bps
-                if side is Side.SELL
-                else BPS + self.close_slippage_bps
-            ) / BPS
-            rules = self.manager.codecs[venue].rules(symbol)
-            price = _round_to_rules(ref * factor, rules, side)
-            intent = OrderIntent(
-                intent_id=new_id(),
-                business_key=f"halt:{halt_id}:{venue.value}:{symbol}",
-                account=account,
-                venue=venue,
-                symbol=symbol,
-                side=side,
-                order_type=OrderType.LIMIT,
-                quantity=abs(position.quantity),
-                created_at_ms=self.clock.now_ms(),
-                trace_id=trace_id,
-                limit_price=price,
-                time_in_force=TimeInForce.IOC,
-                reduce_only=True,
-                strategy="emergency_stop",
-            )
-            view = self.manager.submit(intent)
-            out.append(f"close:{intent.intent_id}:{view.status.value}")
+            try:
+                out.append(
+                    self._close_one(
+                        halt_id=halt_id,
+                        venue=venue,
+                        account=account,
+                        symbol=symbol,
+                        quantity=position.quantity,
+                        trace_id=trace_id,
+                    )
+                )
+            except Exception as exc:
+                out.append(f"close_failed:{symbol}:{type(exc).__name__}")
         return out
 
+    def _close_one(
+        self,
+        *,
+        halt_id: str,
+        venue: Venue,
+        account: str,
+        symbol: str,
+        quantity: Decimal,
+        trace_id: str,
+    ) -> str:
+        ref = self.manager.market.context(venue, symbol).reference_price
+        if ref is None:
+            return f"close_skipped_no_price:{symbol}"
+        side = Side.SELL if quantity > ZERO else Side.BUY
+        slippage = self.close_slippage_bps if side is Side.BUY else -self.close_slippage_bps
+        rules = self.manager.codecs[venue].rules(symbol)
+        price = _round_to_rules(ref * (BPS + slippage) / BPS, rules, side)
+        intent = OrderIntent(
+            intent_id=new_id(),
+            business_key=f"halt:{halt_id}:{venue.value}:{account}:{symbol}",
+            account=account,
+            venue=venue,
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.LIMIT,
+            quantity=abs(quantity),
+            created_at_ms=self.clock.now_ms(),
+            trace_id=trace_id,
+            limit_price=price,
+            time_in_force=TimeInForce.IOC,
+            reduce_only=True,
+            strategy="emergency_stop",
+        )
+        view = self.manager.submit(intent)
+        return f"close:{intent.intent_id}:{view.status.value}"
 
-def _round_to_rules(price: Decimal, rules: object, side: Side) -> Decimal:
+
+def _round_to_rules(price: Decimal, rules: InstrumentRules, side: Side) -> Decimal:
     """Round a protective price onto the venue grid, in the direction that keeps it marketable."""
-    tick = getattr(rules, "tick_size", None)
-    if isinstance(tick, Decimal) and tick > ZERO:
-        return quantize_down(price, tick) if side is Side.SELL else quantize_up(price, tick)
-    return price.quantize(Decimal("0.01"))
+    return rules.round_price(price, side)

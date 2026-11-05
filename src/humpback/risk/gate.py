@@ -1,8 +1,10 @@
 """Pre-trade risk gate.
 
 The gate is the only component that can authorise an order. It returns an ``Approval``: an
-HMAC token bound to the intent hash, the client id and an expiry. The signer verifies the token
-and refuses anything without one, so a strategy cannot reach a venue by skipping the gate.
+HMAC token bound to the action, venue, account, intent hash, client id, a hash of the exact
+request body, and an expiry. The signer verifies the token and recomputes the body hash, so a
+strategy cannot reach a venue by skipping the gate, and an approval for one request (say, a
+cancel) cannot be reused to sign a different one (say, a new order).
 
 Exposure is computed as if every live order fills completely, and ``UNKNOWN_IN_FLIGHT`` orders
 are live. This is the "simulate the portfolio after the fill" check: an order is approved only
@@ -15,34 +17,50 @@ import hashlib
 import hmac
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from humpback.core.clock import Clock, utc_day
 from humpback.core.errors import SignerRefused
-from humpback.core.ids import canonical_json
+from humpback.core.ids import canonical_json, content_hash
 from humpback.core.money import BPS, ZERO
 from humpback.domain.models import OrderIntent, PricingMode, Side, Venue
 from humpback.ledger.book import Ledger
-from humpback.ledger.orders import OrderView
+from humpback.ledger.orders import OrderStatus, OrderView
 from humpback.risk.limits import RiskLimits
 from humpback.risk.supervisor import DAILY_LOSS, Supervisor, TradingMode
-from humpback.venues.base import Action
+from humpback.venues.base import Action, UnsignedRequest
 
 
 @dataclass(frozen=True, slots=True)
 class Approval:
     intent_id: str
     action: Action
+    venue: Venue
+    account: str
     intent_hash: str
     client_id: str
+    body_hash: str
     expires_at_ms: int
     mac: str
 
     def message(self) -> bytes:
-        return _approval_message(
-            self.intent_id, self.action, self.intent_hash, self.client_id, self.expires_at_ms
-        )
+        return canonical_json(
+            [
+                self.intent_id,
+                self.action.value,
+                self.venue.value,
+                self.account,
+                self.intent_hash,
+                self.client_id,
+                self.body_hash,
+                self.expires_at_ms,
+            ]
+        ).encode()
+
+
+def request_body_hash(request: UnsignedRequest) -> str:
+    return content_hash(request.body)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,23 +77,36 @@ class MarketContext:
 PriceLookup = Callable[[Venue, str], Decimal | None]
 
 
-def _approval_message(
-    intent_id: str, action: Action, intent_hash: str, client_id: str, expires_at_ms: int
-) -> bytes:
-    return canonical_json([intent_id, action.value, intent_hash, client_id, expires_at_ms]).encode()
-
-
 def mac_for(key: bytes, message: bytes) -> str:
     return hmac.new(key, message, hashlib.sha256).hexdigest()
 
 
-def verify_approval(key: bytes, approval: Approval, *, now_ms: int) -> None:
+def verify_approval(
+    key: bytes, approval: Approval, request: UnsignedRequest, *, now_ms: int
+) -> None:
     """Used by the signer. Raises ``SignerRefused`` on any problem."""
     expected = mac_for(key, approval.message())
     if not hmac.compare_digest(expected, approval.mac):
         raise SignerRefused("approval MAC does not verify", code="APPROVAL_INVALID")
     if now_ms > approval.expires_at_ms:
         raise SignerRefused("approval expired", code="APPROVAL_EXPIRED")
+    mismatches = [
+        name
+        for name, ours, theirs in (
+            ("intent_id", request.intent_id, approval.intent_id),
+            ("action", request.action, approval.action),
+            ("venue", request.venue, approval.venue),
+            ("account", request.account, approval.account),
+            ("intent_hash", request.intent_hash, approval.intent_hash),
+            ("client_id", request.client_id, approval.client_id),
+            ("body_hash", request_body_hash(request), approval.body_hash),
+        )
+        if ours != theirs
+    ]
+    if mismatches:
+        raise SignerRefused(
+            f"approval does not match request: {mismatches}", code="APPROVAL_MISMATCH"
+        )
 
 
 class RiskGate:
@@ -101,10 +132,25 @@ class RiskGate:
 
     # ------------------------------------------------------------------ public
 
-    def evaluate_place(self, view: OrderView, market: MarketContext) -> Approval | Rejection:
+    def evaluate_place(
+        self, view: OrderView, market: MarketContext, request: UnsignedRequest
+    ) -> Approval | Rejection:
+        try:
+            return self._evaluate_place(view, market, request)
+        except Exception as exc:  # a broken check must reject, never leave the order hanging
+            return Rejection((f"gate_error:{type(exc).__name__}",))
+
+    def _evaluate_place(
+        self, view: OrderView, market: MarketContext, request: UnsignedRequest
+    ) -> Approval | Rejection:
         intent = view.intent
         now = self.clock.now_ms()
         reasons: list[str] = []
+        if view.status is not OrderStatus.CREATED:
+            return Rejection(("order_not_new",))
+        mismatch = self._request_mismatch(view, request, Action.PLACE_ORDER)
+        if mismatch:
+            return Rejection((mismatch,))
         reducing = intent.reduce_only and self._reduces(view)
         if intent.reduce_only and not reducing:
             reasons.append("reduce_only_exceeds_position")
@@ -136,29 +182,46 @@ class RiskGate:
         if reasons:
             return Rejection(tuple(reasons))
         self._recent.append(now)
-        return self._approve(view, Action.PLACE_ORDER, now)
+        return self._approve(view, request, now)
 
-    def approve_cancel(self, view: OrderView) -> Approval | Rejection:
-        """Cancels reduce risk and are allowed in every mode except a manual full halt."""
+    def approve_cancel(self, view: OrderView, request: UnsignedRequest) -> Approval | Rejection:
+        """Cancels reduce risk and are allowed in every mode."""
         if not view.is_live:
             return Rejection(("order_not_live",))
-        return self._approve(view, Action.CANCEL_ORDER, self.clock.now_ms())
+        mismatch = self._request_mismatch(view, request, Action.CANCEL_ORDER)
+        if mismatch:
+            return Rejection((mismatch,))
+        return self._approve(view, request, self.clock.now_ms())
 
     # ------------------------------------------------------------------ checks
 
-    def _approve(self, view: OrderView, action: Action, now: int) -> Approval:
-        expires = now + self.limits.approval_ttl_ms
-        message = _approval_message(
-            view.intent.intent_id, action, view.intent.content_hash(), view.client_id, expires
+    @staticmethod
+    def _request_mismatch(view: OrderView, request: UnsignedRequest, action: Action) -> str | None:
+        intent = view.intent
+        if (
+            request.action is not action
+            or request.venue is not intent.venue
+            or request.account != intent.account
+            or request.intent_id != intent.intent_id
+            or request.client_id != view.client_id
+            or request.intent_hash != intent.content_hash()
+        ):
+            return "request_does_not_match_order"
+        return None
+
+    def _approve(self, view: OrderView, request: UnsignedRequest, now: int) -> Approval:
+        unsigned = Approval(
+            intent_id=view.intent.intent_id,
+            action=request.action,
+            venue=request.venue,
+            account=request.account,
+            intent_hash=view.intent.content_hash(),
+            client_id=view.client_id,
+            body_hash=request_body_hash(request),
+            expires_at_ms=now + self.limits.approval_ttl_ms,
+            mac="",
         )
-        return Approval(
-            view.intent.intent_id,
-            action,
-            view.intent.content_hash(),
-            view.client_id,
-            expires,
-            mac_for(self._key, message),
-        )
+        return replace(unsigned, mac=mac_for(self._key, unsigned.message()))
 
     def _price_checks(self, intent: OrderIntent, ref: Decimal) -> list[str]:
         out = []
@@ -167,7 +230,7 @@ class RiskGate:
                 continue
             deviation = abs(price - ref) / ref * BPS
             if deviation > self.limits.max_price_deviation_bps:
-                out.append(f"{name}_price_deviation_{deviation.quantize(Decimal(1))}bps")
+                out.append(f"{name}_price_deviation_{deviation.to_integral_value()}bps")
         return out
 
     def _scale(self, mode: PricingMode) -> Decimal:
@@ -195,17 +258,21 @@ class RiskGate:
     def _worst_case_qty(
         self, venue: Venue, account: str, symbol: str, extra: tuple[Side, Decimal] | None = None
     ) -> Decimal:
-        """Largest absolute position reachable if every live order on the symbol fills."""
+        """Largest absolute position reachable if every live order on the symbol fills.
+
+        Fills the venue has reported but that are not booked yet count as well.
+        """
         pos = self.ledger.position(venue, account, symbol).quantity
         buys = sells = ZERO
-        for order in self.ledger.live_orders(venue):
+        for order in self.ledger.exposure_orders(venue):
             o = order.intent
             if o.account != account or o.symbol != symbol:
                 continue
+            qty = order.remaining if order.is_live else order.unbooked_qty
             if o.side is Side.BUY:
-                buys += order.remaining
+                buys += qty
             else:
-                sells += order.remaining
+                sells += qty
         if extra is not None:
             side, qty = extra
             if side is Side.BUY:
@@ -219,7 +286,8 @@ class RiskGate:
             (v, a, s) for (v, a, s), p in self.ledger.positions().items() if p.quantity != ZERO
         }
         symbols |= {
-            (o.intent.venue, o.intent.account, o.intent.symbol) for o in self.ledger.live_orders()
+            (o.intent.venue, o.intent.account, o.intent.symbol)
+            for o in self.ledger.exposure_orders()
         }
         symbols.add((intent.venue, intent.account, intent.symbol))
         total = ZERO

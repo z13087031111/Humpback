@@ -7,6 +7,14 @@ happened. "No answer" is never read as "no order".
 Late and duplicate reports are expected (fills after a cancel, an ACK after a fill). They are
 applied when they add information and ignored when they would move an order backwards.
 Contradictions (a reject after a fill, an overfill) raise ``InvalidTransition``.
+
+Two facts are tracked separately from the status, because a status alone loses them:
+
+* ``acknowledged`` – the venue has proven the order exists (ACK, fill, definite status). A
+  cancel sent for an unacknowledged order does not make it any less unknown, and an
+  acknowledged order can never be written off as "not found".
+* ``venue_filled_qty`` – how much the venue says has filled. When it runs ahead of the fills
+  we have booked, the difference still counts as exposure (``unbooked_qty``).
 """
 
 from __future__ import annotations
@@ -60,7 +68,7 @@ LIVE = frozenset(
     }
 )
 
-NEEDS_RESOLUTION = frozenset({OrderStatus.SUBMITTING, OrderStatus.UNKNOWN_IN_FLIGHT})
+_UNPROVEN = frozenset({OrderStatus.SUBMITTING, OrderStatus.UNKNOWN_IN_FLIGHT})
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,10 +84,24 @@ class OrderView:
     updated_at_ms: int = 0
     unknown_since_ms: int | None = None
     not_found_checks: int = 0
+    acknowledged: bool = False
+    venue_filled_qty: Decimal = ZERO
 
     @property
     def remaining(self) -> Decimal:
         return self.intent.quantity - self.filled_qty
+
+    @property
+    def needs_resolution(self) -> bool:
+        """The venue has not yet proven what happened to this order."""
+        if self.status in _UNPROVEN:
+            return True
+        return self.status is OrderStatus.CANCEL_REQUESTED and not self.acknowledged
+
+    @property
+    def unbooked_qty(self) -> Decimal:
+        """Quantity the venue reports as filled that has no booked fill yet."""
+        return max(self.venue_filled_qty - self.filled_qty, ZERO)
 
     @property
     def is_live(self) -> bool:
@@ -103,17 +125,33 @@ def _after_fill_status(view: OrderView) -> OrderStatus:
         return OrderStatus.FILLED
     if view.status in (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.CANCEL_REQUESTED):
         return view.status  # a late fill does not reopen a cancelled order
-    if view.status is OrderStatus.UNKNOWN_IN_FLIGHT:
-        return OrderStatus.PARTIALLY_FILLED  # a fill proves the venue accepted it
-    if view.status is OrderStatus.NOT_FOUND_AT_VENUE:
-        raise InvalidTransition(f"fill for {view.intent.intent_id} after not-found confirmation")
-    return OrderStatus.PARTIALLY_FILLED
+    return OrderStatus.PARTIALLY_FILLED  # from UNKNOWN too: a fill proves the venue accepted it
+
+
+def _decimal(payload: dict[str, Any], key: str) -> Decimal:
+    value = payload.get(key)
+    return ZERO if value in (None, "") else Decimal(str(value))
+
+
+def _venue_filled(view: OrderView, payload: dict[str, Any]) -> Decimal:
+    reported = _decimal(payload, "filled_qty")
+    if reported > view.intent.quantity:
+        raise InvalidTransition(f"venue reports overfill on {view.intent.intent_id}")
+    return max(view.venue_filled_qty, reported)
 
 
 def apply_fill(view: OrderView, fill: Fill, at_ms: int) -> OrderView:
+    if view.status is OrderStatus.NOT_FOUND_AT_VENUE:
+        raise InvalidTransition(f"fill for {view.intent.intent_id} after not-found confirmation")
     if view.status in (OrderStatus.CREATED, OrderStatus.RISK_REJECTED, OrderStatus.REJECTED):
         raise _bad(view, "fill")
-    if fill.side is not view.intent.side or fill.symbol != view.intent.symbol:
+    intent = view.intent
+    if (
+        fill.side is not intent.side
+        or fill.symbol != intent.symbol
+        or fill.venue is not intent.venue
+        or fill.account != intent.account
+    ):
         raise InvalidTransition(f"fill {fill.venue_fill_id} does not match order identity")
     filled = view.filled_qty + fill.quantity
     if filled > view.intent.quantity:
@@ -127,6 +165,7 @@ def apply_fill(view: OrderView, fill: Fill, at_ms: int) -> OrderView:
         fees=view.fees + fill.fee,
         updated_at_ms=at_ms,
         unknown_since_ms=None,
+        acknowledged=True,
     )
     return replace(updated, status=_after_fill_status(updated))
 
@@ -160,7 +199,8 @@ def apply(view: OrderView, kind: EventKind, payload: dict[str, Any], at_ms: int)
 
     if kind is EventKind.VENUE_ACCEPTED:
         venue_order_id = payload.get("venue_order_id") or view.venue_order_id
-        if s in (OrderStatus.SUBMITTING, OrderStatus.UNKNOWN_IN_FLIGHT):
+        venue_filled = _venue_filled(view, payload)
+        if s in _UNPROVEN:
             status = OrderStatus.PARTIALLY_FILLED if view.filled_qty > ZERO else OrderStatus.OPEN
             return replace(
                 view,
@@ -168,15 +208,25 @@ def apply(view: OrderView, kind: EventKind, payload: dict[str, Any], at_ms: int)
                 venue_order_id=venue_order_id,
                 updated_at_ms=at_ms,
                 unknown_since_ms=None,
+                acknowledged=True,
+                venue_filled_qty=venue_filled,
             )
         if s in LIVE or s in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED):
-            return replace(view, venue_order_id=venue_order_id)  # late ACK, no state change
+            # late ACK: no status change, but it does prove the order exists
+            return replace(
+                view,
+                venue_order_id=venue_order_id,
+                acknowledged=True,
+                venue_filled_qty=venue_filled,
+            )
         raise _bad(view, kind)
 
     if kind is EventKind.VENUE_REJECTED:
         if view.filled_qty > ZERO:
             raise InvalidTransition(f"reject after fill on {view.intent.intent_id}")
-        if s in (OrderStatus.SUBMITTING, OrderStatus.UNKNOWN_IN_FLIGHT):
+        if view.acknowledged:
+            raise InvalidTransition(f"reject after acknowledgement on {view.intent.intent_id}")
+        if s in _UNPROVEN:
             return replace(
                 view,
                 status=OrderStatus.REJECTED,
@@ -218,22 +268,21 @@ def apply(view: OrderView, kind: EventKind, payload: dict[str, Any], at_ms: int)
             return view
         raise _bad(view, kind)
 
-    if kind is EventKind.CANCEL_CONFIRMED:
-        if s in LIVE and s is not OrderStatus.SUBMITTING:
+    if kind in (EventKind.CANCEL_CONFIRMED, EventKind.ORDER_EXPIRED):
+        target = OrderStatus.CANCELED if kind is EventKind.CANCEL_CONFIRMED else OrderStatus.EXPIRED
+        venue_filled = _venue_filled(view, payload)
+        if s in LIVE and not (kind is EventKind.CANCEL_CONFIRMED and s is OrderStatus.SUBMITTING):
+            status = OrderStatus.FILLED if view.filled_qty == view.intent.quantity else target
             return replace(
-                view, status=OrderStatus.CANCELED, updated_at_ms=at_ms, unknown_since_ms=None
+                view,
+                status=status,
+                updated_at_ms=at_ms,
+                unknown_since_ms=None,
+                acknowledged=True,
+                venue_filled_qty=venue_filled,
             )
         if s in TERMINAL:
-            return view
-        raise _bad(view, kind)
-
-    if kind is EventKind.ORDER_EXPIRED:
-        if s in LIVE:
-            return replace(
-                view, status=OrderStatus.EXPIRED, updated_at_ms=at_ms, unknown_since_ms=None
-            )
-        if s in TERMINAL:
-            return view
+            return replace(view, venue_filled_qty=venue_filled)
         raise _bad(view, kind)
 
     if kind is EventKind.FILL_RECORDED:
@@ -243,10 +292,17 @@ def apply(view: OrderView, kind: EventKind, payload: dict[str, Any], at_ms: int)
         return _apply_observed(view, payload, at_ms)
 
     if kind is EventKind.NOT_FOUND_CONFIRMED:
-        if s not in NEEDS_RESOLUTION:
+        if not view.needs_resolution:
             raise _bad(view, kind)
-        if view.filled_qty > ZERO:
-            raise InvalidTransition(f"order {view.intent.intent_id} has fills; it was found")
+        if (
+            view.acknowledged
+            or view.venue_order_id is not None
+            or view.filled_qty > ZERO
+            or view.venue_filled_qty > ZERO
+        ):
+            raise InvalidTransition(
+                f"order {view.intent.intent_id} was acknowledged or filled; it cannot be absent"
+            )
         return replace(
             view,
             status=OrderStatus.NOT_FOUND_AT_VENUE,
@@ -263,28 +319,32 @@ def _apply_observed(view: OrderView, payload: dict[str, Any], at_ms: int) -> Ord
     observed = payload["status"]
     venue_order_id = payload.get("venue_order_id") or view.venue_order_id
     if observed == "not_found":
-        if view.status in NEEDS_RESOLUTION:
+        if view.needs_resolution:
             return replace(view, not_found_checks=view.not_found_checks + 1, updated_at_ms=at_ms)
         return view
     target = _OBSERVED.get(observed)
     if target is None:
         raise InvalidTransition(f"unknown observed status {observed!r}")
+    venue_filled = _venue_filled(view, payload)
     if view.status in TERMINAL:
         if target is view.status or view.status is OrderStatus.FILLED:
-            return view
+            return replace(view, venue_filled_qty=venue_filled)
         if target is OrderStatus.FILLED and view.status in (
             OrderStatus.CANCELED,
             OrderStatus.EXPIRED,
         ):
             # Venue says filled, we said cancelled: wait for the fill events to arrive.
-            return view
+            # Meanwhile the unbooked quantity keeps counting as exposure.
+            return replace(view, venue_filled_qty=max(venue_filled, view.intent.quantity))
         raise InvalidTransition(
             f"venue reports {observed} but ledger has {view.status} for {view.intent.intent_id}"
         )
-    if target is OrderStatus.REJECTED and view.filled_qty > ZERO:
+    if target is OrderStatus.REJECTED and (view.filled_qty > ZERO or view.acknowledged):
         raise InvalidTransition(
-            f"venue reports rejected but fills exist on {view.intent.intent_id}"
+            f"venue reports rejected but the order was accepted: {view.intent.intent_id}"
         )
+    if target is OrderStatus.REJECTED:
+        return replace(view, status=target, updated_at_ms=at_ms, unknown_since_ms=None)
     if target is OrderStatus.FILLED and view.filled_qty < view.intent.quantity:
         # The venue says filled but we have not ingested every fill yet. Keep the order live
         # (exposure still counted) until the fills themselves arrive.
@@ -295,11 +355,17 @@ def _apply_observed(view: OrderView, payload: dict[str, Any], at_ms: int) -> Ord
             updated_at_ms=at_ms,
             unknown_since_ms=None,
             not_found_checks=0,
+            acknowledged=True,
+            venue_filled_qty=max(venue_filled, view.intent.quantity),
         )
     if target is OrderStatus.OPEN and view.filled_qty > ZERO:
         target = OrderStatus.PARTIALLY_FILLED
     if target is OrderStatus.OPEN and view.status is OrderStatus.CANCEL_REQUESTED:
         target = OrderStatus.CANCEL_REQUESTED
+    if target in (OrderStatus.CANCELED, OrderStatus.EXPIRED) and (
+        view.filled_qty == view.intent.quantity
+    ):
+        target = OrderStatus.FILLED
     return replace(
         view,
         status=target,
@@ -307,4 +373,6 @@ def _apply_observed(view: OrderView, payload: dict[str, Any], at_ms: int) -> Ord
         updated_at_ms=at_ms,
         unknown_since_ms=None,
         not_found_checks=0,
+        acknowledged=True,
+        venue_filled_qty=venue_filled,
     )

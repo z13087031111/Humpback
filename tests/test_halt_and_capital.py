@@ -39,7 +39,7 @@ def test_emergency_stop_records_three_stages(system: System) -> None:
     assert stages == ["halt_decided", "cancel_or_close_requested", "venue_execution_confirmed"]
 
     system.halt.resume(halt_id, operator="owner")
-    assert not system.supervisor.has(EMERGENCY_STOP)
+    assert not system.supervisor.has_prefix(EMERGENCY_STOP)
 
 
 def test_close_request_is_not_a_closed_position(system: System) -> None:

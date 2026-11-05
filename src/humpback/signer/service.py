@@ -5,8 +5,9 @@ It signs a request only when all of these hold:
 1. the action is on the phase whitelist (phase 1: place and cancel orders only; never
    withdraw, transfer, approve agents or change leverage);
 2. a risk-gate approval is attached, its MAC verifies, and it has not expired;
-3. the approval matches the request exactly: intent id, action, intent hash, client id;
-4. the approval has not been used before (one approval, one signature);
+3. the approval matches the request exactly: intent id, action, venue, account, intent
+   hash, client id and a hash of the request body;
+4. the approval has not been used before (one approval, one signature; persisted);
 5. a backend exists for the venue.
 
 Every decision, signed or refused, is written to the audit log.
@@ -50,7 +51,6 @@ class SignerService:
         self._units = dict(nonce_units)
         self._audit = audit
         self._allowed = allowed_actions
-        self._used: set[str] = set()
 
     def sign(self, request: UnsignedRequest, approval: Approval, *, trace_id: str) -> SignedRequest:
         try:
@@ -83,28 +83,14 @@ class SignerService:
             raise SignerRefused(
                 f"action {request.action} is not whitelisted", code="ACTION_NOT_WHITELISTED"
             )
-        verify_approval(self._key, approval, now_ms=self._clock.now_ms())
-        mismatches = [
-            name
-            for name, ours, theirs in (
-                ("intent_id", request.intent_id, approval.intent_id),
-                ("action", request.action, approval.action),
-                ("intent_hash", request.intent_hash, approval.intent_hash),
-                ("client_id", request.client_id, approval.client_id),
-            )
-            if ours != theirs
-        ]
-        if mismatches:
-            raise SignerRefused(
-                f"approval does not match request: {mismatches}", code="APPROVAL_MISMATCH"
-            )
-        if approval.mac in self._used:
-            raise SignerRefused("approval already used", code="APPROVAL_REPLAY")
+        verify_approval(self._key, approval, request, now_ms=self._clock.now_ms())
         backend = self._backends.get(request.venue)
         if backend is None:
             raise SignerRefused(f"no signing backend for {request.venue}", code="NO_BACKEND")
+        # Consumed before signing and persisted, so a replay fails even after a restart.
+        if not self._nonces.consume_approval(approval.mac, approval.expires_at_ms):
+            raise SignerRefused("approval already used", code="APPROVAL_REPLAY")
         unit = self._units.get(request.venue, "ms")
         nonce = self._nonces.next(backend.address, "us" if unit == "us" else "ms")
         signature, extra = backend.sign(request, nonce)
-        self._used.add(approval.mac)
         return SignedRequest(request, backend.address, nonce, signature, extra)

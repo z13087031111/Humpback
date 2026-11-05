@@ -165,6 +165,10 @@ class TransferBook:
             trace_id=trace_id,
             reference=reference or (evidence.reference if evidence else None),
             received=received,
+            # One proof of arrival can release one lock, never two.
+            dedupe_key=None
+            if evidence is None
+            else f"evidence:{evidence.kind}:{evidence.reference}",
         )
         return self.view(transfer_id)
 
@@ -193,8 +197,9 @@ class TransferBook:
         trace_id: str,
         reference: str | None = None,
         received: Decimal = ZERO,
+        dedupe_key: str | None = None,
     ) -> None:
-        self.ledger.append_raw(
+        event = self.ledger.append_raw(
             EventKind.TRANSFER_EVENT,
             f"transfer:{transfer_id}",
             {
@@ -211,4 +216,7 @@ class TransferBook:
             },
             at_ms=self.clock.now_ms(),
             trace_id=trace_id,
+            dedupe_key=dedupe_key,
         )
+        if event is None:
+            raise InvalidTransition(f"evidence already used: {dedupe_key}")

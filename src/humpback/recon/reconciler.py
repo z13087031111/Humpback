@@ -15,7 +15,6 @@ from humpback.core.clock import Clock
 from humpback.core.money import ZERO
 from humpback.domain.models import Venue
 from humpback.engine import OrderManager
-from humpback.ledger.orders import NEEDS_RESOLUTION
 from humpback.risk.supervisor import Supervisor, TradingMode, recon_mismatch
 
 
@@ -81,7 +80,7 @@ class Reconciler:
 
         remote_open = {o.client_id for o in snapshot.open_orders}
         for view in self.ledger.live_orders(venue):
-            if view.intent.account != account or view.status in NEEDS_RESOLUTION:
+            if view.intent.account != account or view.needs_resolution:
                 continue
             if view.client_id not in remote_open:
                 found.append(

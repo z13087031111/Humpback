@@ -26,6 +26,11 @@ def record(system: System, **kw: object):  # type: ignore[no-untyped-def]
     return view
 
 
+def evaluate(system: System, view, market: MarketContext):  # type: ignore[no-untyped-def]
+    request = system.sim.build_place(view.intent, view.client_id)
+    return system.gate.evaluate_place(view, market, request)
+
+
 def ref(price: str = "50000") -> MarketContext:
     return MarketContext(Decimal(price))
 
@@ -34,7 +39,7 @@ def ref(price: str = "50000") -> MarketContext:
 
 
 def test_gate_approves_a_normal_order(system: System) -> None:
-    assert isinstance(system.gate.evaluate_place(record(system), ref()), Approval)
+    assert isinstance(evaluate(system, record(system), ref()), Approval)
 
 
 @pytest.mark.parametrize(
@@ -50,7 +55,7 @@ def test_gate_approves_a_normal_order(system: System) -> None:
 def test_gate_rejections(
     system: System, kwargs: dict[str, object], market: MarketContext, reason: str
 ) -> None:
-    decision = system.gate.evaluate_place(record(system, **kwargs), market)
+    decision = evaluate(system, record(system, **kwargs), market)
     assert isinstance(decision, Rejection)
     assert reason in decision.reasons
 
@@ -68,7 +73,7 @@ def test_unknown_orders_count_as_exposure(system: System) -> None:
         second.intent.intent_id, EventKind.OUTCOME_UNKNOWN, {"cause": "timeout"}, at_ms=4
     )
     # ...but with two unknown orders in flight a third would breach the 10,000 symbol limit.
-    decision = system.gate.evaluate_place(record(system, qty="0.08"), ref())
+    decision = evaluate(system, record(system, qty="0.08"), ref())
     assert isinstance(decision, Rejection)
     assert "symbol_exposure_limit" in decision.reasons
 
@@ -77,23 +82,23 @@ def test_reduce_only_mode_allows_only_reducing_orders(system: System) -> None:
     system.manager.submit(system.intent(qty="0.05", price="50010"))
     assert system.ledger.position(Venue.SIM, ACCOUNT, "BTC").quantity == Decimal("0.05")
     system.supervisor.raise_reason("x", TradingMode.REDUCE_ONLY, "test", 0)
-    blocked = system.gate.evaluate_place(record(system, qty="0.01"), ref())
+    blocked = evaluate(system, record(system, qty="0.01"), ref())
     assert isinstance(blocked, Rejection) and "mode_reduce_only_blocks_new_risk" in blocked.reasons
     reduce = record(system, qty="0.05", side=Side.SELL, reduce_only=True, price="49990")
-    assert isinstance(system.gate.evaluate_place(reduce, ref()), Approval)
+    assert isinstance(evaluate(system, reduce, ref()), Approval)
     system.supervisor.raise_reason("y", TradingMode.HALTED, "manual", 0)
-    assert isinstance(system.gate.evaluate_place(reduce, ref()), Rejection)
+    assert isinstance(evaluate(system, reduce, ref()), Rejection)
 
 
 def test_order_rate_limit(tmp_path: Path) -> None:
     s = build_system(tmp_path, risk=limits(max_orders_per_minute=2))
     try:
-        assert isinstance(s.gate.evaluate_place(record(s), ref()), Approval)
-        assert isinstance(s.gate.evaluate_place(record(s), ref()), Approval)
-        third = s.gate.evaluate_place(record(s), ref())
+        assert isinstance(evaluate(s, record(s), ref()), Approval)
+        assert isinstance(evaluate(s, record(s), ref()), Approval)
+        third = evaluate(s, record(s), ref())
         assert isinstance(third, Rejection) and "order_rate_limit" in third.reasons
         s.clock.advance(60_000)
-        assert isinstance(s.gate.evaluate_place(record(s), ref()), Approval)
+        assert isinstance(evaluate(s, record(s), ref()), Approval)
     finally:
         s.close()
 
@@ -108,7 +113,7 @@ def test_daily_loss_limit_switches_to_reduce_only(system: System) -> None:
         at_ms=system.clock.now_ms(),
         trace_id="t",
     )
-    decision = system.gate.evaluate_place(record(system), ref())
+    decision = evaluate(system, record(system), ref())
     assert isinstance(decision, Rejection) and "daily_loss_limit" in decision.reasons
     assert system.supervisor.mode is TradingMode.REDUCE_ONLY
 
@@ -118,7 +123,7 @@ def test_daily_loss_limit_switches_to_reduce_only(system: System) -> None:
 
 def test_signer_needs_a_matching_fresh_unused_approval(system: System) -> None:
     view = record(system)
-    approval = system.gate.evaluate_place(view, ref())
+    approval = evaluate(system, view, ref())
     assert isinstance(approval, Approval)
     request = system.sim.build_place(view.intent, view.client_id)
 
@@ -134,7 +139,7 @@ def test_signer_needs_a_matching_fresh_unused_approval(system: System) -> None:
     with pytest.raises(SignerRefused, match="already used"):
         system.signer.sign(request, approval, trace_id="t")
 
-    late = system.gate.evaluate_place(record(system), ref())
+    late = evaluate(system, record(system), ref())
     assert isinstance(late, Approval)
     system.clock.advance(10_000)
     with pytest.raises(SignerRefused, match="expired"):
@@ -150,7 +155,7 @@ def test_signer_needs_a_matching_fresh_unused_approval(system: System) -> None:
 
 def test_signer_never_signs_withdrawals(system: System) -> None:
     view = record(system)
-    approval = system.gate.evaluate_place(view, ref())
+    approval = evaluate(system, view, ref())
     assert isinstance(approval, Approval)
     request = replace(system.sim.build_place(view.intent, view.client_id), action=Action.WITHDRAW)
     with pytest.raises(SignerRefused, match="not whitelisted"):

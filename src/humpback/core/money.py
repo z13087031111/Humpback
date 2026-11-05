@@ -7,7 +7,15 @@ turning into 0.1000000000000000055511151231257827.
 
 from __future__ import annotations
 
+import decimal
 from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
+
+# Inputs are capped at MAX_SIGNIFICANT_DIGITS so that sums and products of two inputs fit
+# inside the working precision exactly. Every thread gets the same precision.
+MAX_SIGNIFICANT_DIGITS = 28
+WORKING_PRECISION = 60
+decimal.DefaultContext.prec = WORKING_PRECISION
+decimal.getcontext().prec = max(decimal.getcontext().prec, WORKING_PRECISION)
 
 ZERO = Decimal(0)
 ONE = Decimal(1)
@@ -30,6 +38,8 @@ def dec(value: DecimalLike) -> Decimal:
         raise MoneyError(f"invalid decimal: {value!r}") from None
     if not result.is_finite():
         raise MoneyError(f"non-finite decimal: {value!r}")
+    if len(result.normalize().as_tuple().digits) > MAX_SIGNIFICANT_DIGITS:
+        raise MoneyError(f"more than {MAX_SIGNIFICANT_DIGITS} significant digits: {value!r}")
     return result
 
 
@@ -53,7 +63,10 @@ def to_wire(value: DecimalLike) -> str:
     This is the form exchanges expect in signed payloads (Hyperliquid's signing guide
     lists trailing zeros as a common cause of bad signatures).
     """
-    normalized = dec(value).normalize()
+    exact = dec(value)
+    normalized = exact.normalize()
+    if normalized != exact:  # pragma: no cover - guarded by the digit cap in dec()
+        raise MoneyError(f"canonical form changed the value of {value!r}")
     if normalized == ZERO:
         return "0"
     return format(normalized, "f")

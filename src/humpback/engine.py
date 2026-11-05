@@ -32,7 +32,7 @@ from humpback.ledger.orders import OrderView
 from humpback.risk.gate import Approval, MarketContext, Rejection, RiskGate
 from humpback.risk.supervisor import UNKNOWN_ORDERS, Supervisor, TradingMode, recon_mismatch
 from humpback.signer.service import SignerService
-from humpback.venues.base import SubmitOutcome, VenueCodec, VenueTransport
+from humpback.venues.base import SubmitOutcome, UnsignedRequest, VenueCodec, VenueTransport
 
 
 class MarketData(Protocol):
@@ -90,7 +90,13 @@ class OrderManager:
         if not created:
             return view  # same decision already recorded: never send it twice
 
-        decision = self.gate.evaluate_place(view, market)
+        try:
+            request = codec.build_place(intent, view.client_id)
+        except Exception as exc:  # the decision is recorded; close it out explicitly
+            return self._transition(
+                view, EventKind.RISK_REJECTED, {"reason": f"build:{type(exc).__name__}"}
+            )
+        decision = self.gate.evaluate_place(view, market, request)
         if isinstance(decision, Rejection):
             self.audit.record(
                 "risk_rejected",
@@ -102,7 +108,7 @@ class OrderManager:
                 view, EventKind.RISK_REJECTED, {"reason": ";".join(decision.reasons)}
             )
         self.audit.record("risk_approved", intent.trace_id, intent_id=intent.intent_id)
-        return self._send_place(view, decision)
+        return self._send_place(view, request, decision)
 
     def _record(self, intent: OrderIntent, codec: VenueCodec) -> tuple[OrderView, bool]:
         now = self.clock.now_ms()
@@ -115,9 +121,10 @@ class OrderManager:
                     raise
         raise LedgerError(f"could not allocate a client id for {intent.business_key}")
 
-    def _send_place(self, view: OrderView, approval: Approval) -> OrderView:
+    def _send_place(
+        self, view: OrderView, request: UnsignedRequest, approval: Approval
+    ) -> OrderView:
         intent = view.intent
-        request = self.codecs[intent.venue].build_place(intent, view.client_id)
         try:
             signed = self.signer.sign(request, approval, trace_id=intent.trace_id)
         except (SignerRefused, SignerUnavailable) as exc:
@@ -135,9 +142,11 @@ class OrderManager:
         if result.outcome is SubmitOutcome.REJECTED:
             view = self._transition(view, EventKind.VENUE_REJECTED, {"reason": result.reason})
         else:
-            view = self._transition(
-                view, EventKind.VENUE_ACCEPTED, {"venue_order_id": result.venue_order_id}
-            )
+            reported = {
+                "venue_order_id": result.venue_order_id,
+                "filled_qty": str(result.filled_qty),
+            }
+            view = self._transition(view, EventKind.VENUE_ACCEPTED, reported)
             self.sync_fills(intent.venue, intent.account)
             view = self.ledger.order(intent.intent_id)
             if result.terminal_status in ("expired", "canceled"):
@@ -146,7 +155,7 @@ class OrderManager:
                     if result.terminal_status == "expired"
                     else EventKind.CANCEL_CONFIRMED
                 )
-                view = self._transition(view, kind, {})
+                view = self._transition(view, kind, {"filled_qty": str(result.filled_qty)})
         return view
 
     # ------------------------------------------------------------------ cancel
@@ -154,11 +163,17 @@ class OrderManager:
     def cancel(self, intent_id: str) -> OrderView:
         view = self.ledger.order(intent_id)
         intent = view.intent
-        decision = self.gate.approve_cancel(view)
+        request = self.codecs[intent.venue].build_cancel(intent, view.client_id)
+        decision = self.gate.approve_cancel(view, request)
         if isinstance(decision, Rejection):
             return view
-        request = self.codecs[intent.venue].build_cancel(intent, view.client_id)
-        signed = self.signer.sign(request, decision, trace_id=intent.trace_id)
+        try:
+            signed = self.signer.sign(request, decision, trace_id=intent.trace_id)
+        except (SignerRefused, SignerUnavailable) as exc:
+            self.audit.record(
+                "cancel_not_signed", intent.trace_id, intent_id=intent_id, code=exc.code
+            )
+            raise
         view = self._transition(view, EventKind.CANCEL_REQUESTED, {})
         try:
             result = self.transports[intent.venue].send(signed)
@@ -169,7 +184,9 @@ class OrderManager:
         self.sync_fills(intent.venue, intent.account)
         view = self.ledger.order(intent_id)
         if result.outcome is SubmitOutcome.ACCEPTED:
-            return self._transition(view, EventKind.CANCEL_CONFIRMED, {})
+            return self._transition(
+                view, EventKind.CANCEL_CONFIRMED, {"filled_qty": str(result.filled_qty)}
+            )
         # Cancel refused (e.g. already filled): ask the venue what actually happened.
         return self.refresh_order(intent_id)
 
@@ -216,7 +233,7 @@ class OrderManager:
     # ------------------------------------------------------------------ helpers
 
     def _transition(
-        self, view: OrderView, kind: EventKind, payload: dict[str, object]
+        self, view: OrderView, kind: EventKind, payload: Mapping[str, object]
     ) -> OrderView:
         return self.ledger.transition(
             view.intent.intent_id, kind, dict(payload), at_ms=self.clock.now_ms()

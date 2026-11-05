@@ -14,6 +14,7 @@ from humpback.domain.models import (
     Fill,
     OrderIntent,
     OrderType,
+    Side,
     TimeInForce,
     Venue,
 )
@@ -93,6 +94,7 @@ class SubmitResult:
     venue_order_id: str | None = None
     reason: str | None = None
     terminal_status: Literal["filled", "expired", "canceled"] | None = None
+    filled_qty: Decimal = ZERO  # cumulative fills the venue reports for this order
 
 
 ObservedStatus = Literal["open", "filled", "canceled", "rejected", "expired", "not_found"]
@@ -108,6 +110,9 @@ class OrderQueryResult:
 class InstrumentRules(Protocol):
     def check(self, intent: OrderIntent, reference_price: Decimal | None) -> None:
         """Raise PrecisionError if the venue would reject the intent's numbers."""
+
+    def round_price(self, price: Decimal, side: Side) -> Decimal:
+        """Round onto the venue's price grid: sells down, buys up."""
 
 
 class VenueCodec(Protocol):

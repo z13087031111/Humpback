@@ -64,6 +64,9 @@ class Supervisor:
     def has(self, code: str) -> bool:
         return code in self._reasons
 
+    def has_prefix(self, prefix: str) -> bool:
+        return any(code == prefix or code.startswith(prefix + ":") for code in self._reasons)
+
     def allows_new_risk(self) -> bool:
         return self.mode is TradingMode.NORMAL
 
@@ -74,8 +77,12 @@ class Supervisor:
 # Standard reason codes
 STARTUP_LOCK = "startup_lock"
 UNKNOWN_ORDERS = "unknown_orders"
-EMERGENCY_STOP = "emergency_stop"
+EMERGENCY_STOP = "emergency_stop"  # one reason per halt: "emergency_stop:<halt_id>"
 DAILY_LOSS = "daily_loss_limit"
+
+
+def emergency_stop(halt_id: str) -> str:
+    return f"{EMERGENCY_STOP}:{halt_id}"
 
 
 def recon_mismatch(venue: str, account: str) -> str:

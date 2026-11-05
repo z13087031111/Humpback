@@ -36,7 +36,6 @@ from humpback.domain.models import (
     TimeInForce,
     Venue,
 )
-from humpback.ledger.book import Position
 from humpback.venues.base import (
     Action,
     OrderQueryResult,
@@ -83,9 +82,42 @@ class _Order:
 
 
 @dataclass
+class _SimPosition:
+    """The venue's own book-keeping, written independently of the ledger's ``Position`` so
+    that reconciliation compares two separate computations."""
+
+    quantity: Decimal = ZERO
+    cost: Decimal = ZERO  # signed quantity x entry price of the open part
+    realized_pnl: Decimal = ZERO
+    fees: Decimal = ZERO
+
+    @property
+    def avg_entry(self) -> Decimal:
+        return ZERO if self.quantity == ZERO else self.cost / self.quantity
+
+    def add(self, signed_qty: Decimal, price: Decimal, fee: Decimal) -> None:
+        self.fees += fee
+        same_direction = self.quantity == ZERO or (self.quantity > ZERO) == (signed_qty > ZERO)
+        if same_direction:
+            self.quantity += signed_qty
+            self.cost += signed_qty * price
+            return
+        closing = min(abs(signed_qty), abs(self.quantity))
+        unit_cost = self.cost / self.quantity
+        sign = Decimal(1) if self.quantity > ZERO else Decimal(-1)
+        self.realized_pnl += closing * (price - unit_cost) * sign
+        self.quantity -= sign * closing
+        self.cost -= sign * closing * unit_cost
+        leftover = abs(signed_qty) - closing
+        if leftover > ZERO:  # flipped through zero
+            self.quantity = -sign * leftover
+            self.cost = -sign * leftover * price
+
+
+@dataclass
 class _Account:
     collateral: Decimal = ZERO
-    positions: dict[str, Position] = field(default_factory=dict)
+    positions: dict[str, _SimPosition] = field(default_factory=dict)
 
 
 class SimVenue:
@@ -289,11 +321,13 @@ class SimVenue:
         return None, ""
 
     def _place(self, intent: OrderIntent, client_id: str, fault: Fault | None) -> SubmitResult:
-        if client_id in self._orders:
+        existing = self._orders.get(client_id)
+        if existing is not None and existing.status == "open":
+            # Like Aster, client ids only need to be unique among *open* orders.
             return SubmitResult(SubmitOutcome.REJECTED, reason="duplicate client id")
         acct = self._accounts.setdefault(intent.account, _Account())
         if intent.reduce_only:
-            pos = acct.positions.get(intent.symbol, Position()).quantity
+            pos = acct.positions.get(intent.symbol, _SimPosition()).quantity
             reduces = (pos > ZERO and intent.side is Side.SELL) or (
                 pos < ZERO and intent.side is Side.BUY
             )
@@ -337,7 +371,10 @@ class SimVenue:
             terminal = "filled"
         self._fault_for_fills = None
         return SubmitResult(
-            SubmitOutcome.ACCEPTED, venue_order_id=order.venue_order_id, terminal_status=terminal
+            SubmitOutcome.ACCEPTED,
+            venue_order_id=order.venue_order_id,
+            terminal_status=terminal,
+            filled_qty=order.filled,
         )
 
     def _cancel(self, client_id: str) -> SubmitResult:
@@ -346,7 +383,10 @@ class SimVenue:
             return SubmitResult(SubmitOutcome.REJECTED, reason="order not open")
         order.status = "canceled"
         return SubmitResult(
-            SubmitOutcome.ACCEPTED, venue_order_id=order.venue_order_id, terminal_status="canceled"
+            SubmitOutcome.ACCEPTED,
+            venue_order_id=order.venue_order_id,
+            terminal_status="canceled",
+            filled_qty=order.filled,
         )
 
     @staticmethod
@@ -382,8 +422,9 @@ class SimVenue:
             filled_at_ms=self.clock.now_ms(),
         )
         acct = self._accounts.setdefault(intent.account, _Account())
-        pos, _ = acct.positions.get(intent.symbol, Position()).apply_fill(fill)
-        acct.positions[intent.symbol] = pos
+        acct.positions.setdefault(intent.symbol, _SimPosition()).add(
+            intent.side.sign * qty, price, fill.fee
+        )
         fault = self._fault_for_fills or (
             Fault.DUPLICATE_FILLS if Fault.DUPLICATE_FILLS in self._sticky else None
         )

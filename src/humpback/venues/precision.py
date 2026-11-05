@@ -17,9 +17,17 @@ from humpback.core.money import (
     ZERO,
     decimal_places,
     is_multiple,
+    quantize_down,
+    quantize_up,
     significant_figures,
 )
-from humpback.domain.models import OrderIntent, OrderType
+from humpback.domain.models import OrderIntent, OrderType, Side
+
+
+def _protective(price: Decimal, step: Decimal, side: Side) -> Decimal:
+    """Round onto a grid in the direction that keeps an aggressive close marketable:
+    sells round down, buys round up."""
+    return quantize_down(price, step) if side is Side.SELL else quantize_up(price, step)
 
 
 def _order_price(intent: OrderIntent, reference_price: Decimal | None) -> Decimal | None:
@@ -49,6 +57,11 @@ class TickStepRules:
             raise PrecisionError(f"{name} {price} above maxPrice {self.max_price}")
         if self.tick_size > ZERO and not is_multiple(price, self.tick_size, self.min_price):
             raise PrecisionError(f"{name} {price} not on tickSize {self.tick_size}")
+
+    def round_price(self, price: Decimal, side: Side) -> Decimal:
+        if self.tick_size <= ZERO:
+            return price
+        return self.min_price + _protective(price - self.min_price, self.tick_size, side)
 
     def check(self, intent: OrderIntent, reference_price: Decimal | None) -> None:
         qty = intent.quantity
@@ -81,6 +94,16 @@ class HyperliquidRules:
     @property
     def max_decimals(self) -> int:
         return 8 if self.is_spot else 6
+
+    def round_price(self, price: Decimal, side: Side) -> Decimal:
+        """Largest grid the rules allow: 5 significant figures and at most
+        ``max_decimals - sz_decimals`` decimals; integers are always allowed."""
+        allowed = self.max_decimals - self.sz_decimals
+        by_sig_figs = 4 - price.adjusted()
+        places = max(min(allowed, by_sig_figs), 0)
+        rounded = _protective(price, Decimal(1).scaleb(-places), side)
+        self.check_price(rounded)
+        return rounded
 
     def check_price(self, price: Decimal, name: str = "price") -> None:
         if price <= ZERO:
@@ -115,6 +138,9 @@ class LighterRules:
     price_decimals: int
     min_base_amount: Decimal
     min_quote_amount: Decimal
+
+    def round_price(self, price: Decimal, side: Side) -> Decimal:
+        return _protective(price, Decimal(1).scaleb(-self.price_decimals), side)
 
     def to_base_int(self, quantity: Decimal) -> int:
         if decimal_places(quantity) > self.size_decimals:
