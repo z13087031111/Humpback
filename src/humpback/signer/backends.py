@@ -76,7 +76,7 @@ def hyperliquid_action_hash(
     """keccak(msgpack(action) ‖ nonce(8B) ‖ vault flag[‖ vault] [‖ 0x00 ‖ expiresAfter(8B)])."""
     try:
         import msgpack
-        from eth_utils import keccak
+        from eth_utils.crypto import keccak
     except ImportError as exc:  # pragma: no cover
         raise SignerUnavailable("install the 'signing' extra (msgpack, eth-account)") from exc
     data: bytes = msgpack.packb(action)
@@ -133,7 +133,7 @@ class HyperliquidAgentBackend:
     ) -> dict[str, Any]:
         eth_account = _eth()
         from eth_account.messages import encode_typed_data
-        from eth_utils import to_hex
+        from eth_utils.conversions import to_hex
 
         connection_id = hyperliquid_action_hash(action, self.vault_address, nonce, expires_after)
         typed = hyperliquid_l1_typed_data(connection_id, self.is_mainnet)
