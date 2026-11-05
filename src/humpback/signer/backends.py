@@ -4,7 +4,8 @@ Real backends need the optional ``signing`` extra (``eth-account``, ``msgpack``)
 algorithms are pinned by test vectors taken from the official SDKs/docs
 (``tests/test_signing_vectors.py``), which run in CI where those packages are installed.
 
-Keys are loaded from an encrypted keystore and kept only in this process's memory.
+Keys are loaded from a Humpback keystore (``keystore.py``) and kept only in this process's
+memory.
 """
 
 from __future__ import annotations
@@ -42,10 +43,11 @@ def _eth() -> Any:
 
 
 def load_private_key(keystore_path: str | Path, passphrase: str) -> bytes:
-    """Decrypt a standard Ethereum keystore (V3 JSON). The passphrase is never stored."""
-    eth_account = _eth()
-    data = Path(keystore_path).read_text()
-    return bytes(eth_account.Account.decrypt(data, passphrase))
+    """Decrypt a Humpback keystore (see ``keystore.py``). The passphrase is never stored."""
+    from humpback.signer.keystore import load
+
+    key, _ = load(keystore_path, passphrase)
+    return key
 
 
 class TestBackend:

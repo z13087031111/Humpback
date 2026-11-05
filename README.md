@@ -30,6 +30,29 @@ mypy
 pytest -q
 ```
 
+## 测试网准备（交给 Claude Code 之前）
+
+私钥只由你本人在自己的终端里输入，不要粘贴到任何 AI 对话里。
+
+1. 为测试网新建一个钱包，不要使用主网钱包。
+2. 在三家测试网分别领取测试币并创建代理密钥：
+   - Hyperliquid：创建 API 钱包（代理）。
+   - Aster：注册代理时 `canWithdraw` 选否，并设置过期时间。
+   - Lighter：使用 4–254 号 API Key 槽位。
+3. 在仓库根目录，为每个代理密钥生成一个加密文件：
+
+   ```bash
+   uv pip install -e ".[signing]"
+   humpback keystore create --venue hyperliquid --label hl-testnet-agent --out var/keys/hl-testnet.keystore.json
+   humpback keystore create --venue aster       --label aster-testnet-agent --out var/keys/aster-testnet.keystore.json
+   humpback keystore create --venue lighter     --label lighter-testnet-key4 --out var/keys/lighter-testnet.keystore.json
+   ```
+
+   命令会提示你输入私钥和口令，输入时屏幕不显示。生成后会打印地址和指纹，请核对地址与交易所页面上的代理地址一致。`var/` 已被 git 忽略，文件权限为 600。
+
+4. 用 `humpback keystore check <文件>` 确认口令正确。
+5. 交给 Claude Code 的只有：公开地址、keystore 文件路径。口令在程序运行时由你在终端输入。
+
 ## 规矩
 
 - 钱只用 `Decimal`。CI 会扫描源码里的 float。

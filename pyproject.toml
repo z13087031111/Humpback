@@ -12,6 +12,7 @@ dependencies = []
 signing = [
   "eth-account>=0.13",
   "msgpack>=1.0",
+  "cryptography>=42",
 ]
 dev = [
   "pytest>=8",
@@ -19,7 +20,11 @@ dev = [
   "mypy>=1.10",
   "eth-account>=0.13",
   "msgpack>=1.0",
+  "cryptography>=42",
 ]
+
+[project.scripts]
+humpback = "humpback.cli:main"
 
 [build-system]
 requires = ["hatchling>=1.25"]
@@ -59,5 +64,5 @@ mypy_path = "src"
 packages = ["humpback"]
 
 [[tool.mypy.overrides]]
-module = ["eth_account.*", "msgpack.*", "eth_utils.*"]
+module = ["eth_account.*", "msgpack.*", "eth_utils.*", "cryptography.*"]
 ignore_missing_imports = true
